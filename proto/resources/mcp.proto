@@ -18,6 +18,7 @@ message McpServerSpec {
   bool disabled = 5;
   McpAuthBrokerSpec auth_broker = 6;
   McpServerPolicy policy = 7;
+  bool forward_caller_context = 8;
 }
 
 message McpAuthBrokerSpec {

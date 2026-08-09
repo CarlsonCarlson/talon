@@ -9,8 +9,8 @@ mod tests {
         authorization_bearer_token, authorization_header, call_tool_for_config,
         clear_broker_auth_cache_for_test, content_type_matches, format_tool_result,
         invalidate_all_broker_auth_cache, invalidate_broker_auth_cache, list_tools_for_config,
-        resolve_http_headers, AuthenticatedReqwestClient, McpAuthBrokerConfig, McpClient,
-        McpConnectionConfig,
+        resolve_http_headers, tool_call_params, AuthenticatedReqwestClient, McpAuthBrokerConfig,
+        McpCallContext, McpClient, McpConnectionConfig,
     };
     use crate::test_support::{EnvVarGuard, PlatformJwtEnvGuard, TEST_PLATFORM_JWT_ISSUER};
     use axum::{
@@ -52,6 +52,7 @@ mod tests {
             args: Vec::new(),
             headers,
             disabled: false,
+            forward_caller_context: false,
             namespace: None,
             mcp_server_name: Some("github".to_string()),
             agent_name: None,
@@ -168,6 +169,31 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("File content here"));
+    }
+
+    #[test]
+    fn tool_call_params_include_trusted_talon_caller_metadata() {
+        let params = tool_call_params(
+            "start_anchor_task",
+            json!({"task": "open example.com"}),
+            Some(&McpCallContext {
+                namespace: "Tenant:nimbus:carlson".to_string(),
+                agent: "nimbus-browser".to_string(),
+                session_id: "session-123".to_string(),
+            }),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(params).unwrap();
+
+        assert_eq!(
+            encoded["_meta"]["talon.impalasys.com/caller"],
+            json!({
+                "namespace": "Tenant:nimbus:carlson",
+                "agent": "nimbus-browser",
+                "sessionId": "session-123"
+            })
+        );
+        assert_eq!(encoded["arguments"], json!({"task": "open example.com"}));
     }
 
     #[tokio::test]
@@ -491,6 +517,7 @@ mod tests {
                 args: vec!["--flag".to_string()],
                 headers: HashMap::from([("Authorization".to_string(), "Bearer token".to_string())]),
                 disabled: true,
+                forward_caller_context: true,
                 auth_broker: None,
                 policy: None,
             }),
@@ -504,6 +531,7 @@ mod tests {
         assert_eq!(config.target, "https://example.com/mcp");
         assert_eq!(config.args, vec!["--flag"]);
         assert!(config.disabled);
+        assert!(config.forward_caller_context);
 
         let missing_meta = manifests::McpServer {
             metadata: None,
@@ -534,6 +562,7 @@ mod tests {
             args: Vec::new(),
             headers: HashMap::new(),
             disabled: true,
+            forward_caller_context: false,
             namespace: None,
             mcp_server_name: None,
             agent_name: None,
@@ -609,6 +638,7 @@ mod tests {
             args: Vec::new(),
             headers: HashMap::new(),
             disabled: false,
+            forward_caller_context: false,
             namespace: Some("conic:wks:42".to_string()),
             mcp_server_name: Some("github".to_string()),
             agent_name: Some("cmo".to_string()),
@@ -648,6 +678,7 @@ mod tests {
             args: Vec::new(),
             headers: HashMap::from([("Authorization".to_string(), "Bearer static".to_string())]),
             disabled: false,
+            forward_caller_context: false,
             namespace: Some("conic:wks:42".to_string()),
             mcp_server_name: Some("github".to_string()),
             agent_name: Some("cmo".to_string()),
@@ -701,6 +732,7 @@ mod tests {
             args: Vec::new(),
             headers: HashMap::new(),
             disabled: false,
+            forward_caller_context: false,
             namespace: Some("conic:wks:42".to_string()),
             mcp_server_name: Some("github".to_string()),
             agent_name: Some("cmo".to_string()),
@@ -777,6 +809,7 @@ mod tests {
             args: Vec::new(),
             headers: HashMap::new(),
             disabled: false,
+            forward_caller_context: false,
             namespace: Some("conic:wks:42".to_string()),
             mcp_server_name: Some("github".to_string()),
             agent_name: Some("cmo".to_string()),
@@ -875,6 +908,7 @@ mod tests {
             args: Vec::new(),
             headers: HashMap::new(),
             disabled: false,
+            forward_caller_context: false,
             namespace: Some("conic:wks:42".to_string()),
             mcp_server_name: Some("github".to_string()),
             agent_name: Some("cmo".to_string()),
@@ -1608,6 +1642,7 @@ mod tests {
             args: Vec::new(),
             headers: HashMap::new(),
             disabled: false,
+            forward_caller_context: false,
             namespace: Some("conic:wks:42".to_string()),
             mcp_server_name: Some("github".to_string()),
             agent_name: Some("cmo".to_string()),

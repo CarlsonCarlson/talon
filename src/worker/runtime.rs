@@ -437,6 +437,7 @@ mod tests {
             args: Vec::new(),
             headers: HashMap::new(),
             disabled: false,
+            forward_caller_context: false,
             namespace: None,
             mcp_server_name: mcp_server_name.map(str::to_string),
             agent_name: None,

@@ -228,6 +228,7 @@ impl McpServerSpecManifest {
                 audience: spec.audience,
             }),
             policy: self.policy.map(McpServerPolicyManifest::into_proto),
+            forward_caller_context: self.forward_caller_context,
         }
     }
 
@@ -251,6 +252,7 @@ impl McpServerSpecManifest {
                 .policy
                 .as_ref()
                 .map(McpServerPolicyManifest::from_proto),
+            forward_caller_context: spec.forward_caller_context,
         }
     }
 }

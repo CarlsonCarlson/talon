@@ -441,6 +441,21 @@ pub fn session_queue_entry(
     )
 }
 
+pub fn session_enqueue_idempotency(
+    namespace: &str,
+    agent: &str,
+    session_id: &str,
+    idempotency_key: &str,
+) -> ResourceKey {
+    let digest = format!("{:x}", Sha256::digest(idempotency_key.as_bytes()));
+    resource_key(
+        namespace,
+        &[("Agent", agent), ("Session", session_id)],
+        "SessionEnqueue",
+        &digest,
+    )
+}
+
 pub fn session_queue_prefix(
     namespace: &str,
     agent: &str,

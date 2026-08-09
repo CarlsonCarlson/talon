@@ -11,8 +11,10 @@ use crate::control::ProtoKeyValueStoreExt;
 use crate::control::{events, keys, keys::ResourceParent, KeyValueStore, ListOptions};
 use crate::gateway::rpc::harness_proto::{chat_content_part, ToolOutput};
 use prost::Message;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
 pub(crate) mod cancellation;
@@ -26,11 +28,51 @@ const MAX_SESSION_MESSAGES_PAGE_SIZE: usize = 200;
 const SESSION_MESSAGE_KEY_SCAN_BATCH_SIZE: usize = 512;
 const DEFAULT_SESSION_STREAM_BATCH_MAX: usize = 10_000;
 const CLEAR_SESSION_CAS_RETRIES: usize = 8;
+const ENQUEUE_RESERVATION_STALE_MICROS: i64 = 30_000_000;
 const LABEL_CONNECTOR_DELIVERY_ERROR: &str = "talon.impalasys.com/connector-delivery-error";
 const LABEL_CONNECTOR_DELIVERY_STATUS: &str = "talon.impalasys.com/connector-delivery-status";
 const RESERVED_CONNECTOR_LABEL_PREFIX: &str = "talon.impalasys.com/connector-";
 const RESERVED_CONNECTOR_MATCH_LABEL_PREFIX: &str = "talon.impalasys.com/connector-match/";
 const RESERVED_EXTERNAL_LABEL_PREFIX: &str = "talon.impalasys.com/external-";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SessionEnqueueReceipt {
+    payload_sha256: String,
+    queue_entry_suffix: String,
+    queued_at_micros: i64,
+    updated_at_micros: i64,
+    accepted: bool,
+    queue_entry_id: String,
+    dispatched: bool,
+    submission_id: String,
+}
+
+fn enqueue_payload_sha256(
+    message: &str,
+    labels: &std::collections::HashMap<String, String>,
+) -> String {
+    let labels = labels
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let payload = serde_json::to_vec(&(message, labels)).expect("enqueue payload is serializable");
+    format!("{:x}", Sha256::digest(payload))
+}
+
+fn enqueue_response(
+    session_id: &str,
+    receipt: &SessionEnqueueReceipt,
+    duplicate: bool,
+) -> proto::EnqueueSessionMessageResponse {
+    proto::EnqueueSessionMessageResponse {
+        session_id: session_id.to_string(),
+        queue_entry_id: receipt.queue_entry_id.clone(),
+        dispatched: receipt.dispatched,
+        submission_id: receipt.submission_id.clone(),
+        accepted: receipt.accepted,
+        duplicate,
+    }
+}
 
 async fn incomplete_tool_batches(
     kv: &dyn KeyValueStore,
@@ -1529,6 +1571,355 @@ impl GrpcGatewayHandler {
         }))
     }
 
+    pub async fn handle_enqueue_session_message(
+        &self,
+        req: tonic::Request<proto::EnqueueSessionMessageRequest>,
+    ) -> std::result::Result<tonic::Response<proto::EnqueueSessionMessageResponse>, tonic::Status>
+    {
+        crate::require_auth!(
+            self,
+            req,
+            &req.get_ref().ns,
+            &req.get_ref().agent,
+            &req.get_ref().session_id
+        );
+        let req = req.into_inner();
+        let session_key = keys::session(&req.ns, &req.agent, &req.session_id);
+        let exists = self
+            .gateway
+            .kv
+            .get(&session_key)
+            .await
+            .map_err(|error| tonic::Status::internal(format!("Failed to fetch session: {error}")))?
+            .is_some();
+        if !exists {
+            return Err(tonic::Status::not_found("Session not found"));
+        }
+        if req.message.trim().is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "message content is required",
+            ));
+        }
+        if req.idempotency_key.trim().is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "idempotency_key is required",
+            ));
+        }
+
+        let idempotency_key = keys::session_enqueue_idempotency(
+            &req.ns,
+            &req.agent,
+            &req.session_id,
+            &req.idempotency_key,
+        );
+        let payload_sha256 = enqueue_payload_sha256(&req.message, &req.labels);
+        let now = chrono::Utc::now();
+        let mut receipt = SessionEnqueueReceipt {
+            payload_sha256: payload_sha256.clone(),
+            queue_entry_suffix: crate::control::uuid::session_message_id(),
+            queued_at_micros: now.timestamp_micros(),
+            updated_at_micros: now.timestamp_micros(),
+            accepted: false,
+            queue_entry_id: String::new(),
+            dispatched: false,
+            submission_id: String::new(),
+        };
+        let mut receipt_bytes = serde_json::to_vec(&receipt).map_err(|error| {
+            tonic::Status::internal(format!("Failed to encode idempotency receipt: {error}"))
+        })?;
+        if !self
+            .gateway
+            .kv
+            .compare_and_swap(&idempotency_key, None, &receipt_bytes)
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("Failed to reserve idempotency key: {error}"))
+            })?
+        {
+            let bytes = self
+                .gateway
+                .kv
+                .get(&idempotency_key)
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!("Failed to read idempotency result: {error}"))
+                })?
+                .ok_or_else(|| tonic::Status::unavailable("Idempotency result is not ready"))?;
+            receipt = serde_json::from_slice(&bytes).map_err(|_| {
+                tonic::Status::failed_precondition("Stored idempotency receipt is invalid")
+            })?;
+            if receipt.payload_sha256 != payload_sha256 {
+                return Err(tonic::Status::already_exists(
+                    "idempotency_key was already used for another payload",
+                ));
+            }
+            if receipt.accepted {
+                if !receipt.dispatched && !receipt.queue_entry_id.is_empty() {
+                    let queue_key = keys::session_queue_entry(
+                        &req.ns,
+                        &req.agent,
+                        &req.session_id,
+                        session_queue::NEXT_QUEUE,
+                        &receipt.queue_entry_id,
+                    );
+                    let still_queued = self
+                        .gateway
+                        .kv
+                        .get(&queue_key)
+                        .await
+                        .map_err(|error| {
+                            tonic::Status::internal(format!(
+                                "Failed to reconcile accepted queued message: {error}"
+                            ))
+                        })?
+                        .is_some();
+                    if still_queued {
+                        if let Some(dispatched) = session_queue::dispatch_next_queued_message(
+                            self.gateway.kv.as_ref(),
+                            self.gateway.pubsub.as_ref(),
+                            &req.ns,
+                            &req.agent,
+                            &req.session_id,
+                            session_queue::NEXT_QUEUE,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            tonic::Status::unavailable(format!(
+                                "Failed to redrive accepted queued message: {error}"
+                            ))
+                        })? {
+                            receipt.dispatched = true;
+                            receipt.submission_id = dispatched.submission_id;
+                            receipt.updated_at_micros = chrono::Utc::now().timestamp_micros();
+                            let updated = serde_json::to_vec(&receipt).map_err(|error| {
+                                tonic::Status::internal(format!(
+                                    "Failed to encode reconciled enqueue receipt: {error}"
+                                ))
+                            })?;
+                            let _ = self
+                                .gateway
+                                .kv
+                                .compare_and_swap(&idempotency_key, Some(&bytes), &updated)
+                                .await;
+                        }
+                    }
+                }
+                return Ok(tonic::Response::new(enqueue_response(
+                    &req.session_id,
+                    &receipt,
+                    true,
+                )));
+            }
+            if now
+                .timestamp_micros()
+                .saturating_sub(receipt.updated_at_micros)
+                <= ENQUEUE_RESERVATION_STALE_MICROS
+            {
+                return Err(tonic::Status::unavailable(
+                    "Idempotency result is not ready; retry the same request",
+                ));
+            }
+            let mut reclaimed = receipt.clone();
+            reclaimed.updated_at_micros = now.timestamp_micros();
+            let reclaimed_bytes = serde_json::to_vec(&reclaimed).map_err(|error| {
+                tonic::Status::internal(format!("Failed to encode idempotency receipt: {error}"))
+            })?;
+            if !self
+                .gateway
+                .kv
+                .compare_and_swap(&idempotency_key, Some(&bytes), &reclaimed_bytes)
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!(
+                        "Failed to reclaim idempotency reservation: {error}"
+                    ))
+                })?
+            {
+                return Err(tonic::Status::unavailable(
+                    "Idempotency result changed; retry the same request",
+                ));
+            }
+            receipt = reclaimed;
+            receipt_bytes = reclaimed_bytes;
+        }
+
+        let queued_at = chrono::DateTime::from_timestamp_micros(receipt.queued_at_micros)
+            .ok_or_else(|| tonic::Status::internal("Stored enqueue timestamp is invalid"))?;
+        let message = data_proto::SessionMessage {
+            id: receipt.queue_entry_suffix.clone(),
+            role: data_proto::MessageRole::RoleUser as i32,
+            created_at: receipt.queued_at_micros,
+            labels: req.labels,
+            parts: vec![data_proto::SessionMessagePart {
+                id: "000000".to_string(),
+                part_type: data_proto::SessionMessagePartType::Text as i32,
+                content: req.message,
+                name: String::new(),
+                payload_json: String::new(),
+                created_at: receipt.queued_at_micros,
+                object: None,
+            }],
+        };
+        let queued = match session_queue::queue_session_message(
+            self.gateway.kv.as_ref(),
+            &req.ns,
+            &req.agent,
+            &req.session_id,
+            session_queue::NEXT_QUEUE,
+            message,
+            queued_at,
+        )
+        .await
+        {
+            Ok(queued) => queued,
+            Err(error) => {
+                receipt.updated_at_micros = 0;
+                if let Ok(retry_bytes) = serde_json::to_vec(&receipt) {
+                    let _ = self
+                        .gateway
+                        .kv
+                        .compare_and_swap(&idempotency_key, Some(&receipt_bytes), &retry_bytes)
+                        .await;
+                }
+                return Err(tonic::Status::internal(format!(
+                    "Failed to enqueue message: {error}"
+                )));
+            }
+        };
+
+        receipt.accepted = true;
+        receipt.queue_entry_id = queued.entry_id.clone();
+        receipt.updated_at_micros = chrono::Utc::now().timestamp_micros();
+        let accepted_bytes = serde_json::to_vec(&receipt).map_err(|error| {
+            tonic::Status::internal(format!(
+                "Failed to encode accepted enqueue receipt: {error}"
+            ))
+        })?;
+        if !self
+            .gateway
+            .kv
+            .compare_and_swap(&idempotency_key, Some(&receipt_bytes), &accepted_bytes)
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("Failed to persist idempotency result: {error}"))
+            })?
+        {
+            return Err(tonic::Status::unavailable(
+                "Idempotency result changed; retry the same request",
+            ));
+        }
+
+        let dispatched = match session_queue::dispatch_next_queued_message(
+            self.gateway.kv.as_ref(),
+            self.gateway.pubsub.as_ref(),
+            &req.ns,
+            &req.agent,
+            &req.session_id,
+            session_queue::NEXT_QUEUE,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            Ok(dispatched) => dispatched,
+            Err(error) => {
+                let queue_key = keys::session_queue_entry(
+                    &req.ns,
+                    &req.agent,
+                    &req.session_id,
+                    session_queue::NEXT_QUEUE,
+                    &queued.entry_id,
+                );
+                let still_queued = self
+                    .gateway
+                    .kv
+                    .get(&queue_key)
+                    .await
+                    .map_err(|read_error| {
+                        tonic::Status::internal(format!(
+                            "Failed to verify queued message after dispatch error: {read_error}"
+                        ))
+                    })?
+                    .is_some();
+                if !still_queued {
+                    receipt.accepted = false;
+                    receipt.queue_entry_id.clear();
+                    receipt.updated_at_micros = 0;
+                    let retry_bytes = serde_json::to_vec(&receipt).map_err(|encode_error| {
+                        tonic::Status::internal(format!(
+                            "Failed to encode retryable idempotency receipt: {encode_error}"
+                        ))
+                    })?;
+                    if !self
+                        .gateway
+                        .kv
+                        .compare_and_swap(&idempotency_key, Some(&accepted_bytes), &retry_bytes)
+                        .await
+                        .map_err(|update_error| {
+                            tonic::Status::internal(format!(
+                                "Failed to make enqueue retryable: {update_error}"
+                            ))
+                        })?
+                    {
+                        return Err(tonic::Status::unavailable(
+                            "Enqueue receipt changed after dispatch failure; retry the same request",
+                        ));
+                    }
+                    return Err(tonic::Status::unavailable(format!(
+                        "Immediate dispatch failed before durable acceptance; retry the same request: {error}"
+                    )));
+                }
+                tracing::warn!(
+                    namespace = %req.ns,
+                    agent = %req.agent,
+                    session_id = %req.session_id,
+                    queue_entry_id = %queued.entry_id,
+                    error = %error,
+                    "message was durably queued but immediate dispatch failed"
+                );
+                None
+            }
+        };
+
+        if let Some(dispatched) = dispatched {
+            receipt.dispatched = true;
+            receipt.submission_id = dispatched.submission_id;
+            receipt.updated_at_micros = chrono::Utc::now().timestamp_micros();
+            let dispatched_bytes = serde_json::to_vec(&receipt).map_err(|error| {
+                tonic::Status::internal(format!(
+                    "Failed to encode dispatched enqueue receipt: {error}"
+                ))
+            })?;
+            match self
+                .gateway
+                .kv
+                .compare_and_swap(&idempotency_key, Some(&accepted_bytes), &dispatched_bytes)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    namespace = %req.ns,
+                    agent = %req.agent,
+                    session_id = %req.session_id,
+                    "enqueue receipt changed before dispatch result was recorded"
+                ),
+                Err(error) => tracing::warn!(
+                    namespace = %req.ns,
+                    agent = %req.agent,
+                    session_id = %req.session_id,
+                    error = %error,
+                    "failed to update EnqueueMessage idempotency result after dispatch"
+                ),
+            }
+        }
+
+        Ok(tonic::Response::new(enqueue_response(
+            &req.session_id,
+            &receipt,
+            false,
+        )))
+    }
+
     pub async fn handle_append_session_message(
         &self,
         req: tonic::Request<proto::AppendSessionMessageRequest>,
@@ -2557,6 +2948,98 @@ mod tests {
             marker.object.as_ref().map(|object| object.key.as_str()),
             Some("cas/conic/sessions/session-1/compactions/submission-1/000001.txt")
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_session_message_accepts_busy_session() {
+        let kv = Arc::new(MockKvStore::default());
+        let pubsub = Arc::new(RecordingPubSub::default());
+        let handler = handler(kv.clone(), pubsub);
+        let ns = "conic";
+        let agent = "coding";
+        let session_id = "session-1";
+        seed_session(kv.as_ref(), ns, agent, session_id).await;
+        let key = keys::session(ns, agent, session_id);
+        let mut session = kv
+            .get_msg::<data_proto::Session>(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        session.status = "PROCESSING".to_string();
+        session.last_active = chrono::Utc::now().timestamp_micros();
+        kv.set_msg(&key, &session).await.unwrap();
+
+        let response = handler
+            .handle_enqueue_session_message(tonic::Request::new(
+                proto::EnqueueSessionMessageRequest {
+                    ns: ns.to_string(),
+                    agent: agent.to_string(),
+                    session_id: session_id.to_string(),
+                    message: "Anchor task completed".to_string(),
+                    labels: HashMap::from([("anchor-event-id".to_string(), "event-1".to_string())]),
+                    idempotency_key: "anchor:job-1:terminal".to_string(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.session_id, session_id);
+        assert!(response.accepted);
+        assert!(!response.duplicate);
+        assert!(!response.queue_entry_id.is_empty());
+        assert!(!response.dispatched);
+        assert!(response.submission_id.is_empty());
+
+        let queued = handler
+            .handle_list_queued_session_messages(tonic::Request::new(
+                proto::ListQueuedSessionMessagesRequest {
+                    ns: ns.to_string(),
+                    agent: agent.to_string(),
+                    session_id: session_id.to_string(),
+                    queue: crate::control::session_queue::NEXT_QUEUE.to_string(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(queued.entries.len(), 1);
+        let message = queued.entries[0].message.as_ref().unwrap();
+        assert_eq!(message.parts[0].content, "Anchor task completed");
+        assert_eq!(message.labels["anchor-event-id"], "event-1");
+
+        let duplicate = handler
+            .handle_enqueue_session_message(tonic::Request::new(
+                proto::EnqueueSessionMessageRequest {
+                    ns: ns.to_string(),
+                    agent: agent.to_string(),
+                    session_id: session_id.to_string(),
+                    message: "Anchor task completed".to_string(),
+                    labels: HashMap::from([("anchor-event-id".to_string(), "event-1".to_string())]),
+                    idempotency_key: "anchor:job-1:terminal".to_string(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(duplicate.accepted);
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.queue_entry_id, response.queue_entry_id);
+
+        let conflict = handler
+            .handle_enqueue_session_message(tonic::Request::new(
+                proto::EnqueueSessionMessageRequest {
+                    ns: ns.to_string(),
+                    agent: agent.to_string(),
+                    session_id: session_id.to_string(),
+                    message: "Different callback payload".to_string(),
+                    labels: HashMap::from([("anchor-event-id".to_string(), "event-1".to_string())]),
+                    idempotency_key: "anchor:job-1:terminal".to_string(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
     }
 
     #[tokio::test]

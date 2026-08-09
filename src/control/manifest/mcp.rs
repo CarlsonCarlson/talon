@@ -20,6 +20,7 @@ struct McpServerSpecManifest {
     disabled: bool,
     auth_broker: Option<McpAuthBrokerSpecManifest>,
     policy: Option<McpServerPolicyManifest>,
+    forward_caller_context: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]

@@ -16,6 +16,7 @@ service SessionService {
   rpc Compact(CompactSessionRequest) returns (stream talon.events.SessionMessagePartEvent);
   rpc Doctor(DoctorSessionRequest) returns (DoctorSessionResponse);
   rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  rpc EnqueueMessage(EnqueueSessionMessageRequest) returns (EnqueueSessionMessageResponse);
   rpc AppendMessage(AppendSessionMessageRequest) returns (AppendSessionMessageResponse);
   rpc UpdateMessage(UpdateSessionMessageRequest) returns (UpdateSessionMessageResponse);
   rpc AnswerPermission(AnswerSessionPermissionRequest) returns (AnswerSessionPermissionResponse);
@@ -171,6 +172,24 @@ message SendMessageRequest {
 message SendMessageResponse {
   string reply = 1;
   string session_id = 4;
+}
+
+message EnqueueSessionMessageRequest {
+  string session_id = 1;
+  string agent = 2;
+  string ns = 3;
+  string message = 4;
+  map<string, string> labels = 5;
+  string idempotency_key = 6;
+}
+
+message EnqueueSessionMessageResponse {
+  string session_id = 1;
+  string queue_entry_id = 2;
+  bool dispatched = 3;
+  string submission_id = 4;
+  bool accepted = 5;
+  bool duplicate = 6;
 }
 
 message AppendSessionMessageRequest {

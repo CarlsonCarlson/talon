@@ -16,7 +16,9 @@ use crate::harness::llm::{
     ChatContentPart, ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, LlmProvider,
     TokenCounter, ToolCall,
 };
-use crate::harness::mcp::{call_tool_for_config, McpConnectionConfig};
+use crate::harness::mcp::{
+    call_tool_for_config, call_tool_for_config_with_context, McpCallContext, McpConnectionConfig,
+};
 use crate::harness::skills::registry::ToolRegistry;
 use crate::harness::telemetry;
 use anyhow::Result;
@@ -1222,6 +1224,20 @@ impl AgentExecutor {
     async fn execute_tool(&self, name: &str, input: &str) -> Result<ToolOutput> {
         let args: Value = serde_json::from_str(input).unwrap_or(Value::Null);
         if let Some(tool) = self.mcp_tools.get(name) {
+            if tool.config.forward_caller_context {
+                return call_tool_for_config_with_context(
+                    &tool.config,
+                    &tool.remote_name,
+                    args,
+                    &McpCallContext {
+                        namespace: self.namespace.clone(),
+                        agent: self.agent_id.clone(),
+                        session_id: self.session_id.clone(),
+                    },
+                )
+                .await
+                .map(ToolOutput::text);
+            }
             return call_tool_for_config(&tool.config, &tool.remote_name, args)
                 .await
                 .map(ToolOutput::text);

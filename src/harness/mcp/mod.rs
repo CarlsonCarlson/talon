@@ -8,7 +8,7 @@ use base64::{engine::general_purpose, Engine as _};
 use futures::{stream::BoxStream, StreamExt};
 use reqwest::header::ACCEPT;
 use rmcp::{
-    model::{CallToolRequestParams, Content, ResourceContents},
+    model::{CallToolRequestParams, Content, Meta, ResourceContents},
     model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
     service::{RoleClient, RunningService, ServiceExt},
     transport::{
@@ -73,11 +73,42 @@ pub struct McpConnectionConfig {
     pub args: Vec<String>,
     pub headers: HashMap<String, String>,
     pub disabled: bool,
+    pub forward_caller_context: bool,
     pub namespace: Option<String>,
     pub mcp_server_name: Option<String>,
     pub agent_name: Option<String>,
     pub jwt_issuer: Option<String>,
     pub auth_broker: Option<McpAuthBrokerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpCallContext {
+    pub namespace: String,
+    pub agent: String,
+    pub session_id: String,
+}
+
+pub fn tool_call_params(
+    name: &str,
+    arguments: Value,
+    context: Option<&McpCallContext>,
+) -> Result<CallToolRequestParams> {
+    let arguments = match arguments {
+        Value::Null => None,
+        other => Some(serde_json::from_value::<Map<String, Value>>(other)?),
+    };
+    let mut params =
+        CallToolRequestParams::new(name.to_string()).with_arguments(arguments.unwrap_or_default());
+    if let Some(context) = context {
+        let mut meta = Map::new();
+        meta.insert(
+            "talon.impalasys.com/caller".to_string(),
+            serde_json::to_value(context)?,
+        );
+        params.meta = Some(Meta(meta));
+    }
+    Ok(params)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,19 +179,20 @@ impl McpClient {
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String> {
+        self.call_tool_with_context(name, arguments, None).await
+    }
+
+    pub async fn call_tool_with_context(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: Option<&McpCallContext>,
+    ) -> Result<String> {
         match &self.backend {
             McpBackend::Rmcp(service) => {
-                let arguments = match arguments {
-                    Value::Null => None,
-                    other => Some(serde_json::from_value::<Map<String, Value>>(other)?),
-                };
-
                 let result = service
                     .peer()
-                    .call_tool(
-                        CallToolRequestParams::new(name.to_string())
-                            .with_arguments(arguments.unwrap_or_default()),
-                    )
+                    .call_tool(tool_call_params(name, arguments, context)?)
                     .await?;
 
                 format_tool_result(
@@ -454,6 +486,7 @@ impl TryFrom<&manifests::McpServer> for McpConnectionConfig {
             args: spec.args.clone(),
             headers: spec.headers.clone(),
             disabled: spec.disabled,
+            forward_caller_context: spec.forward_caller_context,
             namespace: (!meta.namespace.is_empty()).then(|| meta.namespace.clone()),
             mcp_server_name: Some(meta.name.clone()),
             agent_name: None,
@@ -506,6 +539,18 @@ pub async fn call_tool_for_config(
 ) -> Result<String> {
     let client = connect_configured(config).await?;
     client.call_tool(name, arguments).await
+}
+
+pub async fn call_tool_for_config_with_context(
+    config: &McpConnectionConfig,
+    name: &str,
+    arguments: Value,
+    context: &McpCallContext,
+) -> Result<String> {
+    let client = connect_configured(config).await?;
+    client
+        .call_tool_with_context(name, arguments, Some(context))
+        .await
 }
 
 pub async fn invalidate_broker_auth_cache(ns: &str, mcp_server_name: Option<&str>) {

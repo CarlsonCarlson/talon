@@ -39,6 +39,7 @@ spec:
   args: []
   headers: {}
   disabled: false
+  forwardCallerContext: true
   policy:
     tools:
       allowlist:
@@ -51,6 +52,7 @@ spec:
         else {
             panic!("expected McpServer spec");
         };
+        assert!(spec.forward_caller_context);
         assert_eq!(spec.policy.unwrap().tools.unwrap().allowlist, vec!["search"]);
     }
 
